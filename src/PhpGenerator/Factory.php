@@ -197,8 +197,7 @@ final class Factory
 		foreach ($nodeFinder->findInstanceOf($class, Node\Stmt\ClassMethod::class) as $method) {
 			/** @var Node\Stmt\ClassMethod $method */
 			if ($method->stmts) {
-				$start = $method->stmts[0]->getAttribute('startFilePos');
-				$body = substr($code, $start, end($method->stmts)->getAttribute('endFilePos') - $start + 1);
+				$body = $this->extractBodyWithFQN($nodeFinder, $code, $method->stmts);
 				$bodies[$method->name->toString()] = Helpers::indentPhp($body, -2);
 			}
 		}
@@ -213,14 +212,54 @@ final class Factory
 		}
 
 		[$code, $stmts] = $this->parse($from);
+
+		$nodeFinder = new PhpParser\NodeFinder;
 		/** @var Node\Stmt\Function_ $function */
-		$function = (new PhpParser\NodeFinder)->findFirst($stmts, function (Node $node) use ($from) {
+		$function = $nodeFinder->findFirst($stmts, function (Node $node) use ($from) {
 			return $node instanceof Node\Stmt\Function_ && $node->namespacedName->toString() === $from->name;
 		});
 
-		$start = $function->stmts[0]->getAttribute('startFilePos');
-		$body = substr($code, $start, end($function->stmts)->getAttribute('endFilePos') - $start + 1);
+		$body = $this->extractBodyWithFQN($nodeFinder, $code, $function->stmts);
 		return Helpers::indentPhp($body, -1);
+	}
+
+
+	/**
+	 * @param  Node[]  $statements
+	 */
+	private function extractBodyWithFQN(PhpParser\NodeFinder $nodeFinder, string $originalCode, array $statements): string
+	{
+		$start = $statements[0]->getAttribute('startFilePos');
+		$body = substr($originalCode, $start, end($statements)->getAttribute('endFilePos') - $start + 1);
+
+		$resolvedFQNames = [];
+		//collect all name-nodes with resolved fully-qualified name
+		foreach ($nodeFinder->findInstanceOf($statements, Node\Name::class) as $namedNode) {
+			if ($namedNode->hasAttribute('resolvedName')
+				&& $namedNode->getAttribute('resolvedName') instanceof Node\Name\FullyQualified
+			) {
+				$resolvedFQNames[] = $namedNode->getAttributes();
+			}
+		}
+
+		//sort collected resolved names by position in file
+		usort($resolvedFQNames, function ($a, $b) {
+			return $a['startFilePos'] <=> $b['startFilePos'];
+		});
+		$correctiveOffset = -$start;
+		//replace changes body length so we need correct offset
+		foreach ($resolvedFQNames as $resolvedFQName) {
+			$replacement = $resolvedFQName['resolvedName']->toCodeString();
+			$replacingStringLength = $resolvedFQName['endFilePos'] - $resolvedFQName['startFilePos'] + 1;
+			$body = substr_replace(
+				$body,
+				$replacement,
+				$correctiveOffset + $resolvedFQName['startFilePos'],
+				$replacingStringLength
+			);
+			$correctiveOffset += strlen($replacement) - $replacingStringLength;
+		}
+		return $body;
 	}
 
 
@@ -240,7 +279,7 @@ final class Factory
 		$stmts = $parser->parse($code);
 
 		$traverser = new PhpParser\NodeTraverser;
-		$traverser->addVisitor(new PhpParser\NodeVisitor\NameResolver);
+		$traverser->addVisitor(new PhpParser\NodeVisitor\NameResolver(null, ['replaceNodes' => false]));
 		$stmts = $traverser->traverse($stmts);
 
 		return [$code, $stmts];
